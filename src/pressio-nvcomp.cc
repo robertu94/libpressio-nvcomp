@@ -6,6 +6,9 @@
 #include <nvcomp.hpp>
 #include <nvcomp/cascaded.hpp>
 
+extern "C" void libpressio_register_nvcomp() {
+}
+
 class pressio_cuda_error : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
@@ -151,7 +154,7 @@ class pressio_nvcomp: public libpressio_compressor_plugin {
   }
   pressio_options get_configuration_impl() const override {
     pressio_options opts;
-    set(opts, "pressio:thread_safe", static_cast<int32_t>(pressio_thread_safety_multiple));
+    set(opts, "pressio:thread_safe", pressio_thread_safety_multiple);
     set(opts, "pressio:stability", "experimental");
     return opts;
   }

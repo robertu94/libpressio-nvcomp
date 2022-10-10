@@ -1,6 +1,6 @@
 ## template for a CMake C++ Library
 cmake_minimum_required(VERSION 3.14)
-project(pressio-nvcomp VERSION "0.0.1" LANGUAGES CXX CUDA)
+project(libpressio_nvcomp VERSION "0.0.2" LANGUAGES CXX CUDA)
 
 #correct was to set a default build type
 # https://blog.kitware.com/cmake-and-the-default-build-type/
@@ -27,38 +27,65 @@ endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(BUILD_SHARED_LIBS "build pressio-nvcomp as a shared library" ON)
+option(BUILD_SHARED_LIBS "build libpressio_nvcomp as a shared library" ON)
 
-find_package(LibPressio)
-find_package(std_compat)
-find_package(nvcomp)
-find_package(CUDAToolkit)
+find_package(LibPressio REQUIRED)
+find_package(std_compat REQUIRED)
+find_package(nvcomp REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
-add_library(pressio-nvcomp
+add_library(libpressio_nvcomp
   ./src/pressio-nvcomp.cc
   )
 target_link_libraries(
-  pressio-nvcomp
+  libpressio_nvcomp
+  PRIVATE
   LibPressio::libpressio
   CUDA::cudart
   nvcomp::nvcomp
   )
+target_include_directories(libpressio_nvcomp
+  PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/pressio-nvcomp>
+  )
 configure_file(
-  ${CMAKE_CURRENT_SOURCE_DIR}/pressio-nvcomp.pc.in
-  ${CMAKE_CURRENT_BINARY_DIR}/pressio-nvcomp.pc
+  ${CMAKE_CURRENT_SOURCE_DIR}/libpressio-nvcomp.pc.in
+  ${CMAKE_CURRENT_BINARY_DIR}/libpressio-nvcomp.pc
   @ONLY
   )
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/libpressio-nvcomp_version.h.in
+  ${CMAKE_CURRENT_BINARY_DIR}/include/libpressio_nvcomp_version.h
+  )
 
-export(TARGETS pressio-nvcomp NAMESPACE pressio-nvcomp:: FILE pressio-nvcomp.cmake)
-install(TARGETS pressio-nvcomp EXPORT pressio-nvcomp
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/include/libpressio_nvcomp_version.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pressio-nvcomp)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libpressio-nvcomp.pc DESTINATION ${CMAKE_INSTALL_PREFIX}/share/pkgconfig)
+install(TARGETS libpressio_nvcomp 
+  EXPORT LibPressioNVCompTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
   )
-install(EXPORT pressio-nvcomp NAMESPACE pressio-nvcomp:: DESTINATION share/pressio-nvcomp/cmake)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/include/pressio-nvcomp_version.h
-  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pressio-nvcomp)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/pressio-nvcomp.pc DESTINATION ${CMAKE_INSTALL_PREFIX}/share/pkgconfig)
+
+install(EXPORT LibPressioNVCompTargets NAMESPACE LibPressioNVComp:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LibPressioNVComp/)
+include(CMakePackageConfigHelpers)
+configure_package_config_file(${CMAKE_CURRENT_SOURCE_DIR}/LibPressioNVCompConfig.cmake.in
+  "${CMAKE_CURRENT_BINARY_DIR}/LibPressioNVCompConfig.cmake"
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LibPressioNVComp
+)
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/LibPressioNVCompConfigVersion.cmake"
+  VERSION "${PROJECT_VERSION}"
+  COMPATIBILITY AnyNewerVersion
+)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/LibPressioNVCompConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/LibPressioNVCompConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/LibPressioNVComp
+)
 
 
 option(USE_CLANG_TIDY "include clang-tidy warnings in the build log" OFF)
