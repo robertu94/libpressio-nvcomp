@@ -1,13 +1,69 @@
+#include <map>
 #include <libpressio_ext/cpp/compressor.h>
 #include <libpressio_ext/cpp/pressio.h>
 #include <std_compat/memory.h>
+#include <std_compat/functional.h>
 #include <sstream>
 #include <cuda.h>
 #include <nvcomp.hpp>
+#include <nvcomp/nvcompManagerFactory.hpp>
 #include <nvcomp/cascaded.hpp>
+#include <nvcomp/gdeflate.hpp>
+#include <nvcomp/bitcomp.hpp>
+#include <nvcomp/snappy.hpp>
+#include <nvcomp/lz4.hpp>
 
 extern "C" void libpressio_register_nvcomp() {
 }
+
+namespace libpressio { namespace nvcomp_ns {
+
+  /**
+ * this class is a standard c++ idiom for closing resources
+ * it calls the function passed in during the destructor.
+ */
+class cleanup {
+  public:
+    cleanup() noexcept: cleanup_fn([]{}), do_cleanup(false) {}
+
+    template <class Function>
+    cleanup(Function f) noexcept: cleanup_fn(std::forward<Function>(f)), do_cleanup(true) {}
+    cleanup(cleanup&& rhs) noexcept: cleanup_fn(std::move(rhs.cleanup_fn)), do_cleanup(compat::exchange(rhs.do_cleanup, false)) {}
+    cleanup(cleanup const&)=delete;
+    cleanup& operator=(cleanup const&)=delete;
+    cleanup& operator=(cleanup && rhs) noexcept { 
+      if(&rhs == this) return *this;
+      do_cleanup = compat::exchange(rhs.do_cleanup, false);
+      cleanup_fn = std::move(rhs.cleanup_fn);
+      return *this;
+    }
+    ~cleanup() { if(do_cleanup) cleanup_fn(); }
+
+  private:
+    std::function<void()> cleanup_fn;
+    bool do_cleanup;
+};
+template<class Function>
+cleanup make_cleanup(Function&& f) {
+  return cleanup(std::forward<Function>(f));
+}
+
+
+enum lp_nv_exec_mode{
+  LP_NV_CASCADED = 0,
+  LP_NV_LZ4 = 1,
+  LP_NV_SNAPPY = 2,
+  LP_NV_BITCOMP = 3,
+  LP_NV_GDEFLATE = 4,
+};
+
+std::map<std::string, int> lp_nv_exec_mode_map {
+  {"cascade", LP_NV_CASCADED},
+  {"lz4", LP_NV_LZ4},
+  {"snappy", LP_NV_SNAPPY},
+  {"bitcomp", LP_NV_BITCOMP},
+  {"gdeflate", LP_NV_GDEFLATE},
+};
 
 class pressio_cuda_error : public std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -18,123 +74,18 @@ void pressio_cuda_check(cudaError err) {
   }
 }
 
-struct compress_impl_typed {
-  template <class T>
-  pressio_data operator()(T const* begin, T const* end) {
-    std::unique_ptr<nvcomp::CascadedCompressor> c;
-    void* d_temp = nullptr;
-
-    //assume data is on the CPU for now
-    const size_t in_bytes = std::distance(begin, end);
-    T* in_space;
-    pressio_cuda_check(cudaMalloc(&in_space, in_bytes));
-    pressio_cuda_check(cudaMemcpy(in_space, begin, in_bytes, cudaMemcpyHostToDevice));
-
-    if (g_fopts) {
-      //use full custom
-      c = compat::make_unique<nvcomp::CascadedCompressor>(
-        nvcomp::TypeOf<T>(),
-        g_fopts->num_RLEs,
-        g_fopts->num_deltas,
-        g_fopts->use_bp
-        );
-    } else if(g_opts) {
-      //customize the search
-      nvcomp::CascadedSelector<T> selector(in_space, in_bytes, *g_opts);
-
-      size_t temp_size = selector.get_temp_size();
-      pressio_cuda_check(cudaMalloc(&d_temp, temp_size));
-
-      double estimate_ratio;
-      nvcompCascadedFormatOpts fopts = selector.select_config(d_temp, temp_size, &estimate_ratio, stream);
-
-      c = compat::make_unique<nvcomp::CascadedCompressor>(
-        nvcomp::TypeOf<T>(),
-        fopts.num_RLEs,
-        fopts.num_deltas,
-        fopts.use_bp
-        );
-    } else {
-      //use full auto
-      c = compat::make_unique<nvcomp::CascadedCompressor>(
-        nvcomp::TypeOf<T>() 
-        );
-    }
-
-
-
-    size_t temp_bytes, output_bytes;
-    c->configure(in_bytes, &temp_bytes, &output_bytes);
-    void *temp_space, *output_space;
-    pressio_cuda_check(cudaMalloc(&temp_space, temp_bytes));
-    pressio_cuda_check(cudaMalloc(&output_space, output_bytes));
-
-    size_t* d_compresed_bytes;
-    pressio_cuda_check(cudaMallocHost(&d_compresed_bytes, sizeof(size_t)));
-
-    c->compress_async(
-        in_space, in_bytes,
-        temp_space, temp_bytes,
-        output_space, d_compresed_bytes,
-        stream
-        );
-
-    pressio_cuda_check(cudaStreamSynchronize(stream));
-    uint8_t* host_buffer = static_cast<uint8_t*>(malloc(*d_compresed_bytes));
-
-    pressio_cuda_check(cudaMemcpy(
-        host_buffer,
-        output_space,
-        *d_compresed_bytes,
-        cudaMemcpyDeviceToHost
-        ));
-    auto data(pressio_data::move(
-        pressio_byte_dtype,
-        host_buffer,
-        {*d_compresed_bytes},
-        pressio_data_libc_free_fn,
-        nullptr
-        ));
-
-    pressio_cuda_check(cudaFreeHost(d_compresed_bytes));
-    if(d_temp) {
-      pressio_cuda_check(cudaFree(d_temp));
-    }
-    pressio_cuda_check(cudaFree(temp_space));
-    pressio_cuda_check(cudaFree(output_space));
-    return data;
-  }
-
-  cudaStream_t &stream;
-  compat::optional<nvcompCascadedSelectorOpts>& g_opts;
-  compat::optional<nvcompCascadedFormatOpts>& g_fopts;
-};
-
 class pressio_nvcomp: public libpressio_compressor_plugin {
+  private:
   pressio_options get_options_impl() const override {
     pressio_options opts;
-
-    set_type(opts, "nvcomp_cascade:mode", pressio_option_charptr_type);
-
-    if(g_fopts) {
-      set(opts, "nvcomp_cascade:use_bp", g_fopts->use_bp);
-      set(opts, "nvcomp_cascade:num_deltas", g_fopts->num_deltas);
-      set(opts, "nvcomp_cascade:num_rles", g_fopts->num_RLEs);
-    } else {
-      set_type(opts, "nvcomp_cascade:use_bp", pressio_option_int32_type);
-      set_type(opts, "nvcomp_cascade:num_deltas", pressio_option_int32_type);
-      set_type(opts, "nvcomp_cascade:num_rles", pressio_option_int32_type);
-    }
-
-    if(g_opts) {
-      set(opts, "nvcomp_cascade:num_samples", g_opts->num_samples);
-      set(opts, "nvcomp_cascade:sample_size", g_opts->sample_size);
-      set(opts, "nvcomp_cascade:seed", g_opts->seed);
-    } else {
-      set_type(opts, "nvcomp_cascade:num_samples", pressio_option_uint64_type);
-      set_type(opts, "nvcomp_cascade:sample_size", pressio_option_uint64_type);
-      set_type(opts, "nvcomp_cascade:seed", pressio_option_uint32_type);
-    }
+    set(opts, "nvcomp:chunk_size", chunk_size);
+    set(opts, "nvcomp:device", device);
+    set(opts, "nvcomp:num_rles", num_rles);
+    set(opts, "nvcomp:num_deltas", num_deltas);
+    set(opts, "nvcomp:use_bp", use_bp);
+    set(opts, "nvcomp:alg", alg);
+    set_type(opts, "nvcomp:alg_str", pressio_option_charptr_type);
+    set(opts, "nvcomp:nvcomp_alg", nvcomp_alg);
 
     return opts;
   }
@@ -144,12 +95,14 @@ class pressio_nvcomp: public libpressio_compressor_plugin {
 
     libpressio bindings for the NVIDIA nvcomp GPU compressors
     )");
-    set(opts, "nvcomp_cascade:use_bp", "use bit packing");
-    set(opts, "nvcomp_cascade:num_deltas", "number of delta encodings to use");
-    set(opts, "nvcomp_cascade:num_rles", "number of run length encodings to use");
-    set(opts, "nvcomp_cascade:num_samples", "number of samples to use while configuring automatically");
-    set(opts, "nvcomp_cascade:sample_size", "size of samples to use while configuring automatically");
-    set(opts, "nvcomp_cascade:seed", "seed to use while generating samples");
+    set(opts, "nvcomp:chunk_size", "chunk size: default 4096, valid values are 512 to 16384");
+    set(opts, "nvcomp:device", "nvidia device to execute on");
+    set(opts, "nvcomp:num_rles", "number of run length encoding to preform");
+    set(opts, "nvcomp:num_deltas", "number of delta encodings to preform");
+    set(opts, "nvcomp:use_bp", "preform bit comp as the last step");
+    set(opts, "nvcomp:alg", "which algorithm to use");
+    set(opts, "nvcomp:alg_str", "which algorithm to use as a string");
+    set(opts, "nvcomp:nvcomp_alg", "for nvcomp algorithms that support it, which variant to use");
     return opts;
   }
   pressio_options get_configuration_impl() const override {
@@ -158,107 +111,149 @@ class pressio_nvcomp: public libpressio_compressor_plugin {
     set(opts, "pressio:stability", "experimental");
     return opts;
   }
-  int set_options_impl(const pressio_options &options) override {
-    std::string mode;
-    if(get(options, "nvcomp_cascade:mode", &mode) == pressio_options_key_set) {
-      if(mode == "auto") {
-        g_opts = compat::nullopt;
-        g_fopts = compat::nullopt;
+  int set_options_impl(const pressio_options &opts) override {
+    get(opts, "nvcomp:chunk_size", &chunk_size);
+    get(opts, "nvcomp:device", &device);
+    get(opts, "nvcomp:num_rles", &num_rles);
+    get(opts, "nvcomp:num_deltas", &num_deltas);
+    get(opts, "nvcomp:use_bp", &use_bp);
+    bool alg_set = false;
+    int32_t tmp;
+    if(get(opts, "nvcomp:alg", &tmp) == pressio_options_key_set) {
+      if(tmp >= 0 && tmp <= LP_NV_GDEFLATE) {
+        alg = tmp;
+        alg_set = true;
+      } else {
+        return set_error(1, "unsupported alg_str " + std::to_string(tmp));
+      }
+    }
+    std::string tmp_s;
+    if(get(opts, "nvcomp:alg_str", &tmp_s) == pressio_options_key_set) {
+      std::map<std::string, int>::iterator it;
+      if((it = lp_nv_exec_mode_map.find(tmp_s)) != lp_nv_exec_mode_map.end()) {
+        alg = it->second;
+        alg_set = true;
+      } else {
+        return set_error(1, "unsupported alg_str " + tmp_s);
       }
     }
 
-
-    {
-      decltype(nvcompCascadedFormatOpts::num_deltas) ndelta;
-      decltype(nvcompCascadedFormatOpts::num_RLEs) nrle;
-      decltype(nvcompCascadedFormatOpts::use_bp) usebp;
-      auto s1 = get(options, "nvcomp_cascade:num_deltas", &ndelta);
-      auto s2 = get(options, "nvcomp_cascade:num_rles", &nrle);
-      auto s3 = get(options, "nvcomp_cascade:use_bp", &usebp);
-      if(s1 == pressio_options_key_set && s2 == pressio_options_key_set && s3 == pressio_options_key_set) {
-        nvcompCascadedFormatOpts fopts;
-        fopts.use_bp = usebp;
-        fopts.num_deltas = ndelta;
-        fopts.num_RLEs = nrle;
-        g_fopts = fopts;
-      } else if (s1 == pressio_options_key_set || s2 == pressio_options_key_set || s3 == pressio_options_key_set) {
-        return set_error(1, "you must set num_rles, num_deltas, and use_bp together or not at all");
-      }
-    }
-
-    {
-      decltype(nvcompCascadedSelectorOpts::seed) seed;
-      decltype(nvcompCascadedSelectorOpts::num_samples) num_samples;
-      decltype(nvcompCascadedSelectorOpts::sample_size) sample_size;
-
-      auto s1 = get(options, "nvcomp_cascade:seed", &seed);
-      auto s2 = get(options, "nvcomp_cascade:num_samples", &num_samples);
-      auto s3 = get(options, "nvcomp_cascade:sample_size", &sample_size);
-      if(s1 == pressio_options_key_set && s2 == pressio_options_key_set && s3 == pressio_options_key_set) {
-        nvcompCascadedSelectorOpts opts;
-        opts.sample_size = sample_size;
-        opts.num_samples = num_samples;
-        opts.seed = seed;
-        g_opts = opts;
-      } else if (s1 == pressio_options_key_set || s2 == pressio_options_key_set || s3 == pressio_options_key_set) {
-        return set_error(2, "you must set seed, num_samples, and sample_size together or not at all");
+    
+    tmp = 0;
+    pressio_options_key_status st;
+    if((st = get(opts, "nvcomp:nvcomp_alg", &tmp)) == pressio_options_key_set  || alg_set) {
+      switch(alg) {
+        case LP_NV_SNAPPY:
+        case LP_NV_LZ4:
+        case LP_NV_CASCADED:
+          nvcomp_alg = 0;
+          break;
+        case LP_NV_GDEFLATE:
+          if(tmp >= 0 && tmp <= 2) {
+            nvcomp_alg = tmp;
+          } else {
+            nvcomp_alg = 0;
+          }
+        case LP_NV_BITCOMP:
+          if(tmp >= 0 && tmp <= 1) {
+            nvcomp_alg = tmp;
+          } else {
+            nvcomp_alg = 0;
+          }
       }
     }
     return 0;
   }
 
+  std::unique_ptr<nvcomp::nvcompManagerBase> get_manager(cudaStream_t stream, pressio_dtype dtype) {
+    if(dtype != pressio_byte_dtype) {
+      throw std::runtime_error("unsupported type");
+    }
+    nvcompType_t t = NVCOMP_TYPE_CHAR;
+    switch(alg) {
+      case LP_NV_CASCADED:
+        return compat::make_unique<nvcomp::CascadedManager>(nvcompBatchedCascadedOpts_t{
+              static_cast<size_t>(chunk_size),
+              t,
+              num_rles,
+              num_deltas,
+              use_bp
+            }, stream, device);
+      case LP_NV_BITCOMP:
+        return compat::make_unique<nvcomp::BitcompManager>(t, nvcomp_alg, stream, device);
+      case LP_NV_GDEFLATE:
+        return compat::make_unique<nvcomp::GdeflateManager>(t, nvcomp_alg, stream, device);
+      case LP_NV_SNAPPY:
+        return compat::make_unique<nvcomp::SnappyManager>(chunk_size, stream, device);
+      case LP_NV_LZ4:
+        return compat::make_unique<nvcomp::LZ4Manager>(chunk_size, t, stream, device);
+    }
+    throw std::runtime_error("unsupported compression algorithm");
+  }
+
 
   int compress_impl(const pressio_data *input, struct pressio_data *output) override {
     try {
-      *output = pressio_data_for_each<pressio_data>(*input, compress_impl_typed{stream, g_opts, g_fopts});
-      return 0;
-    } catch(pressio_cuda_error const& ex) {
-      return set_error(6, ex.what());
-    } catch(nvcomp::NVCompException const& ex) {
-      return set_error(3, ex.what());
+      cudaStream_t stream;
+      pressio_cuda_check(cudaStreamCreate(&stream));
+      auto cleanup_stream = make_cleanup([&stream]{ cudaStreamDestroy(stream); });
+
+      auto mgr = get_manager(stream, pressio_byte_dtype);
+      nvcomp::CompressionConfig cfg = mgr->configure_compression(input->size_in_bytes());
+
+      uint8_t* comp_buffer;
+      pressio_cuda_check(cudaMalloc(&comp_buffer, cfg.max_compressed_buffer_size));
+      auto cleanup_comp = cleanup([comp_buffer]{cudaFree(comp_buffer);});
+
+      uint8_t* input_buffer;
+      pressio_cuda_check(cudaMalloc(&input_buffer, input->size_in_bytes()));
+      auto cleanup_input= make_cleanup([input_buffer]{cudaFree(input_buffer);});
+      pressio_cuda_check(cudaMemcpy(input_buffer, input->data(), input->size_in_bytes(), cudaMemcpyHostToDevice));
+
+      mgr->compress(input_buffer, comp_buffer, cfg);
+
+      size_t comp_size = mgr->get_compressed_output_size(comp_buffer);
+
+      if(output->capacity_in_bytes() < comp_size) {
+        *output = pressio_data::owning(pressio_byte_dtype, {comp_size});
+      } else {
+        output->set_dtype(pressio_byte_dtype);
+        output->set_dimensions({comp_size});
+      }
+
+      pressio_cuda_check(cudaMemcpy(output->data(), comp_buffer, comp_size, cudaMemcpyDeviceToHost));
+      pressio_cuda_check(cudaStreamSynchronize(stream));
+    } catch(std::runtime_error const& ex) {
+      return set_error(1, ex.what());
     }
+
+     return 0;
   }
   int decompress_impl(const pressio_data *input, struct pressio_data *output) override {
     try {
-    nvcomp::CascadedDecompressor decompressor;
-    //assume for now the data is on the host
+      cudaStream_t stream;
+      pressio_cuda_check(cudaStreamCreate(&stream));
+      auto cleanup_stream = make_cleanup([&stream]{ cudaStreamDestroy(stream); });
+      uint8_t* comp_buffer;
+      pressio_cuda_check(cudaMalloc(&comp_buffer, input->size_in_bytes()));
+      auto cleanup_comp = cleanup([comp_buffer]{cudaFree(comp_buffer);});
+      pressio_cuda_check(cudaMemcpy(comp_buffer, input->data(), input->size_in_bytes(), cudaMemcpyHostToDevice));
 
-    void* compressed_data;
-    size_t compressed_bytes = input->size_in_bytes();
-    pressio_cuda_check(cudaMalloc(&compressed_data, compressed_bytes));
-    pressio_cuda_check(cudaMemcpy(compressed_data, input->data(), compressed_bytes, cudaMemcpyHostToDevice));
+      auto mgr = nvcomp::create_manager(comp_buffer, stream, device);
+      nvcomp::DecompressionConfig cfg = mgr->configure_decompression(comp_buffer);
 
-    size_t temp_bytes;
-    size_t uncompressed_bytes;
+      uint8_t* out_buffer;
+      pressio_cuda_check(cudaMalloc(&out_buffer, cfg.decomp_data_size));
+      auto cleanup_out = make_cleanup([out_buffer]{cudaFree(out_buffer);});
 
-    decompressor.configure(
-        compressed_data,
-        compressed_bytes,
-        &temp_bytes,
-        &uncompressed_bytes,
-        stream);
+      mgr->decompress(out_buffer, comp_buffer, cfg);
+      
+      pressio_cuda_check(cudaMemcpy(output->data(), out_buffer, output->size_in_bytes(), cudaMemcpyDeviceToHost));
 
-    void *temp_space, *uncompressed_output;
-    pressio_cuda_check(cudaMalloc(&temp_space, temp_bytes));
-    pressio_cuda_check(cudaMalloc(&uncompressed_output, uncompressed_bytes));
-
-    decompressor.decompress_async(
-        compressed_data, compressed_bytes, temp_space,
-        temp_bytes, uncompressed_output, uncompressed_bytes, stream);
-
-    cudaStreamSynchronize(stream);
-
-    pressio_cuda_check(cudaMemcpy(
-        output->data(),
-        uncompressed_output,
-        uncompressed_bytes,
-        cudaMemcpyDeviceToHost));
-    } catch(pressio_cuda_error const& ex) {
-      return set_error(4, ex.what());
-    } catch(nvcomp::NVCompException const& ex) {
-      return set_error(5, ex.what());
+      pressio_cuda_check(cudaStreamSynchronize(stream));
+    } catch(std::runtime_error const& ex) {
+      return set_error(1, ex.what());
     }
-
     return 0;
   }
 
@@ -274,7 +269,7 @@ class pressio_nvcomp: public libpressio_compressor_plugin {
 
   void set_name_impl(std::string const& new_name) override {
   }
-  const char* prefix() const override { return "nvcomp_cascade"; }
+  const char* prefix() const override { return "nvcomp"; }
   const char* version() const override { 
     const static std::string version_str = [this]{
       std::stringstream ss;
@@ -287,16 +282,21 @@ class pressio_nvcomp: public libpressio_compressor_plugin {
     return compat::make_unique<pressio_nvcomp>(*this);
   }
 
-  cudaStream_t stream = 0;
-  compat::optional<nvcompCascadedSelectorOpts> g_opts = compat::nullopt;
-  compat::optional<nvcompCascadedFormatOpts> g_fopts = compat::nullopt;
+  int32_t chunk_size = 1<<16;
+  int32_t device = 0;
+  int32_t num_rles = 2;
+  int32_t num_deltas = 1;
+  int32_t use_bp = 1;
+  int32_t alg = LP_NV_CASCADED;
+  int32_t nvcomp_alg = 0;
 };
 
 static pressio_register pressio_nvcomp_register(
     compressor_plugins(),
-    "nvcomp_cascade",
+    "nvcomp",
     []{
       return compat::make_unique<pressio_nvcomp>();
     }
     );
 
+} }
