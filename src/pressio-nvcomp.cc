@@ -86,6 +86,7 @@ class pressio_nvcomp: public libpressio_compressor_plugin {
     set(opts, "nvcomp:alg", alg);
     set_type(opts, "nvcomp:alg_str", pressio_option_charptr_type);
     set(opts, "nvcomp:nvcomp_alg", nvcomp_alg);
+    set_type(opts, "pressio:lossless", pressio_option_int32_type);
 
     return opts;
   }
@@ -109,6 +110,8 @@ class pressio_nvcomp: public libpressio_compressor_plugin {
     pressio_options opts;
     set(opts, "pressio:thread_safe", pressio_thread_safety_multiple);
     set(opts, "pressio:stability", "experimental");
+    set(opts, "pressio:lossless:min", 0);
+    set(opts, "pressio:lossless:max", 0);
     return opts;
   }
   int set_options_impl(const pressio_options &opts) override {
