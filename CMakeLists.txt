@@ -1,6 +1,6 @@
 ## template for a CMake C++ Library
 cmake_minimum_required(VERSION 3.14)
-project(libpressio_nvcomp VERSION "0.0.4" LANGUAGES CXX CUDA)
+project(libpressio_nvcomp VERSION "0.0.5" LANGUAGES CXX CUDA)
 
 #correct was to set a default build type
 # https://blog.kitware.com/cmake-and-the-default-build-type/

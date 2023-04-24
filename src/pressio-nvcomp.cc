@@ -112,6 +112,12 @@ class pressio_nvcomp: public libpressio_compressor_plugin {
     set(opts, "pressio:stability", "experimental");
     set(opts, "pressio:lossless:min", 0);
     set(opts, "pressio:lossless:max", 0);
+    std::vector<std::string> alg_strings;
+    for (auto const& i : lp_nv_exec_mode_map) {
+       alg_strings.push_back(i.first); 
+    }
+    set(opts, "nvcomp:alg_str", alg_strings);
+
     return opts;
   }
   int set_options_impl(const pressio_options &opts) override {
