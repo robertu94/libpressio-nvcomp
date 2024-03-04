@@ -118,6 +118,14 @@ class pressio_nvcomp: public libpressio_compressor_plugin {
     }
     set(opts, "nvcomp:alg_str", alg_strings);
 
+    
+        std::vector<std::string> invalidations {"nvcomp:chunk_size", "nvcomp:device", "nvcomp:num_rles", "nvcomp:num_deltas", "nvcomp:use_bp", "nvcomp:alg", "nvcomp:alg_str", "nvcomp:nvcomp_alg"}; 
+        std::vector<pressio_configurable const*> invalidation_children {}; 
+        
+        set(opts, "predictors:error_dependent", get_accumulate_configuration("predictors:error_dependent", invalidation_children, {}));
+        set(opts, "predictors:error_agnostic", get_accumulate_configuration("predictors:error_agnostic", invalidation_children, invalidations));
+        set(opts, "predictors:runtime", get_accumulate_configuration("predictors:runtime", invalidation_children, invalidations));
+
     return opts;
   }
   int set_options_impl(const pressio_options &opts) override {
